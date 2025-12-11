@@ -1,2 +1,2 @@
 # las2mcfunction
-lasデータ
+lasデータをmcfunctionのsetblockデータに変換します。
