@@ -1,21 +1,28 @@
+# ============================================================
+# las2mcfunction
+# Linux / WSL2 / Docker 対応
+# CPU / CUDA / OpenCL 自動切り替え CMakeLists
+# ============================================================
+
 cmake_minimum_required(VERSION 3.21)
 project(las2mcfunction LANGUAGES C CXX)
 
-# -----------------------------
+# ------------------------------------------------------------
 # Options
-# -----------------------------
-option(ENABLE_CUDA "Enable CUDA acceleration" ON)
+# ------------------------------------------------------------
+option(ENABLE_CUDA   "Enable CUDA acceleration if available" ON)
+option(ENABLE_OPENCL "Enable OpenCL acceleration if available" ON)
 
-# -----------------------------
-# C++ settings
-# -----------------------------
+# ------------------------------------------------------------
+# C / C++ settings
+# ------------------------------------------------------------
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
-# -----------------------------
+# ------------------------------------------------------------
 # Sources
-# -----------------------------
+# ------------------------------------------------------------
 set(SRC
     main.cpp
     miniz.c
@@ -26,82 +33,116 @@ set(HEADERS
     miniz.h
 )
 
-# Windows resource
-if (WIN32)
-    set(WIN_RESOURCE
-        resources/app.rc
-    )
-endif()
+# ------------------------------------------------------------
+# Executable (base: CPU only)
+# ------------------------------------------------------------
+add_executable(las2mcfunction
+    ${SRC}
+    ${HEADERS}
+)
 
-# -----------------------------
-# CUDA
-# -----------------------------
+target_compile_definitions(las2mcfunction PRIVATE USE_CPU=1)
+
+# ------------------------------------------------------------
+# CUDA (Linux / WSL2 / Docker safe)
+# ------------------------------------------------------------
+set(USE_CUDA FALSE)
+
 if (ENABLE_CUDA)
-    enable_language(CUDA)
-    add_definitions(-DENABLE_CUDA)
+    include(CheckLanguage)
+    check_language(CUDA)
 
-    set(CUDA_SRC
-        cuda_kernel.cu
-    )
+    if (CMAKE_CUDA_COMPILER)
+        enable_language(CUDA)
+        set(USE_CUDA TRUE)
 
-    set(CMAKE_CUDA_STANDARD 17)
-    set(CMAKE_CUDA_STANDARD_REQUIRED ON)
+        message(STATUS "CUDA compiler found: ${CMAKE_CUDA_COMPILER}")
 
-    add_executable(las2mcfunction
-        ${SRC}
-        ${HEADERS}
-        ${CUDA_SRC}
-        ${WIN_RESOURCE}
-    )
+        set(CMAKE_CUDA_STANDARD 17)
+        set(CMAKE_CUDA_STANDARD_REQUIRED ON)
 
-    set_target_properties(las2mcfunction PROPERTIES
-        CUDA_SEPARABLE_COMPILATION ON
-        CUDA_ARCHITECTURES native
-    )
-
-    if (MSVC)
-        target_compile_options(las2mcfunction PRIVATE
-            $<$<COMPILE_LANGUAGE:CUDA>:-allow-unsupported-compiler>
+        target_sources(las2mcfunction PRIVATE
+            cuda_kernel.cu
         )
+
+        target_compile_definitions(las2mcfunction PRIVATE
+            ENABLE_CUDA=1
+            USE_CUDA=1
+        )
+
+        set_target_properties(las2mcfunction PROPERTIES
+            CUDA_SEPARABLE_COMPILATION ON
+        )
+
+        # Docker / WSL2 / 古いnvcc対策
+        if (DEFINED CMAKE_CUDA_ARCHITECTURES)
+            set_property(TARGET las2mcfunction PROPERTY
+                CUDA_ARCHITECTURES native
+            )
+        endif()
+
+    else()
+        message(WARNING "CUDA not found -> building without CUDA")
     endif()
+endif()
 
-else()
-    add_executable(las2mcfunction
-        ${SRC}
-        ${HEADERS}
-        ${WIN_RESOURCE}
+# ------------------------------------------------------------
+# OpenCL (Linux / WSL2 / Docker)
+# ------------------------------------------------------------
+set(USE_OPENCL FALSE)
+
+if (ENABLE_OPENCL)
+    find_package(OpenCL QUIET)
+
+    if (OpenCL_FOUND)
+        set(USE_OPENCL TRUE)
+
+        message(STATUS "OpenCL found")
+
+        target_sources(las2mcfunction PRIVATE
+            opencl_map.cpp
+        )
+
+        target_link_libraries(las2mcfunction PRIVATE
+            OpenCL::OpenCL
+        )
+
+        target_compile_definitions(las2mcfunction PRIVATE
+            ENABLE_OPENCL=1
+            USE_OPENCL=1
+        )
+    else()
+        message(STATUS "OpenCL not found -> building without OpenCL")
+    endif()
+endif()
+
+# ------------------------------------------------------------
+# Platform-specific (Linux / WSL2 / Docker)
+# ------------------------------------------------------------
+if (UNIX AND NOT APPLE)
+    target_link_libraries(las2mcfunction PRIVATE
+        pthread
+        dl
+        m
     )
 endif()
 
-# Try to find OpenCL and enable optional OpenCL mapping
-find_path(OPENCL_INCLUDE_DIR CL/cl.h)
-find_library(OPENCL_LIBRARY NAMES OpenCL OpenCL32)
-if(OPENCL_INCLUDE_DIR AND OPENCL_LIBRARY)
-    message(STATUS "OpenCL found: ${OPENCL_LIBRARY}")
-    target_include_directories(las2mcfunction PRIVATE ${OPENCL_INCLUDE_DIR})
-    target_link_libraries(las2mcfunction PRIVATE ${OPENCL_LIBRARY})
-    target_compile_definitions(las2mcfunction PRIVATE USE_OPENCL=1)
-    # add optional source implementing OpenCL mapping
-    target_sources(las2mcfunction PRIVATE opencl_map.cpp)
-else()
-    message(STATUS "OpenCL not found; building without OpenCL support")
-endif()
-
-# -----------------------------
-# Platform specifics
-# -----------------------------
-if (WIN32)
-    target_compile_definitions(las2mcfunction PRIVATE
-        WIN32_LEAN_AND_MEAN
-        NOMINMAX
-    )
-endif()
-
-# -----------------------------
+# ------------------------------------------------------------
 # Warnings
-# -----------------------------
-if (MSVC)
-    target_compile_options(las2mcfunction PRIVATE /W4)
-else()
-    target_compile_options(las2mcfunction PRIVATE -Wall -Wextra -Wpedantic)
+# ------------------------------------------------------------
+if (CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+    target_compile_options(las2mcfunction PRIVATE
+        -Wall
+        -Wextra
+        -Wpedantic
+    )
 endif()
+
+# ------------------------------------------------------------
+# Build summary
+# ------------------------------------------------------------
+message(STATUS "========== Build Configuration ==========")
+message(STATUS "CPU support     : ENABLED")
+message(STATUS "CUDA support    : ${USE_CUDA}")
+message(STATUS "OpenCL support  : ${USE_OPENCL}")
+message(STATUS "=========================================")
