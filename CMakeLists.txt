@@ -19,6 +19,9 @@ option(ENABLE_OPENCL "Enable OpenCL acceleration if available" ON)
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
+if (MSVC)
+    set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded")
+endif()
 
 # ------------------------------------------------------------
 # Sources
@@ -146,3 +149,4 @@ message(STATUS "CPU support     : ENABLED")
 message(STATUS "CUDA support    : ${USE_CUDA}")
 message(STATUS "OpenCL support  : ${USE_OPENCL}")
 message(STATUS "=========================================")
+
