@@ -47,30 +47,44 @@ static bool read_las_header(const std::string& path, LasHeader& H) {
 }
 
 // Load LAS: outputs coordinates (X,Y,Z) into coords and corresponding RGB (0..255) into colors.
-static bool load_points_from_las(const fs::path& p, std::vector<Point3>& coords, std::vector<Point3>& colors) {
-    LasHeader H; if (!read_las_header(p.string(), H)) return false;
-    std::ifstream ifs(p.string(), std::ios::binary); if (!ifs) return false;
+static bool load_points_from_las(
+    const fs::path& p,
+    std::vector<Point3>& coords,
+    std::vector<Point3>& colors)
+{
+    LasHeader H;
+    if (!read_las_header(p.string(), H)) return false;
+
+    std::ifstream ifs(p.string(), std::ios::binary);
+    if (!ifs) return false;
+
     ifs.seekg(H.offset_to_point_data, std::ios::beg);
     std::vector<uint8_t> rec(H.rec_len);
-    std::unordered_set<uint64_t> seen; seen.reserve(100000);
-    coords.clear(); colors.clear(); coords.reserve(std::min<size_t>(H.num_points, 1000000));
+
+    coords.clear();
+    colors.clear();
+
     for (uint32_t i = 0; i < H.num_points; ++i) {
-        ifs.read((char*)rec.data(), rec.size()); if ((size_t)ifs.gcount() < rec.size()) break;
-        int32_t xi = (int32_t)le32(&rec[0]); int32_t yi = (int32_t)le32(&rec[4]); int32_t zi = (int32_t)le32(&rec[8]);
-        int X = (int)std::llround((xi * H.xs + H.xo));
-        int Y = (int)std::llround((yi * H.ys + H.yo));
-        int Z = (int)std::llround((zi * H.zs + H.zo));
-        uint64_t key = (((uint64_t)(uint32_t)X) << 42) ^ (((uint64_t)(uint32_t)Y) << 21) ^ (uint32_t)Z;
-        if (seen.find(key) != seen.end()) continue;
-        seen.insert(key);
+        ifs.read((char*)rec.data(), rec.size());
+        if ((size_t)ifs.gcount() < rec.size()) break;
+
+        int32_t xi = (int32_t)le32(&rec[0]);
+        int32_t yi = (int32_t)le32(&rec[4]);
+        int32_t zi = (int32_t)le32(&rec[8]);
+
+        double X = xi * H.xs + H.xo;
+        double Y = yi * H.ys + H.yo;
+        double Z = zi * H.zs + H.zo;
+
         int r = 255, g = 255, b = 255;
         if (H.point_format == 2 || H.point_format == 3) {
-            size_t base = H.rec_len >= 6 ? H.rec_len - 6 : 0;
-            uint16_t rr = le16(&rec[base]); uint16_t gg = le16(&rec[base + 2]); uint16_t bb = le16(&rec[base + 4]);
-            r = (rr >> 8); g = (gg >> 8); b = (bb >> 8);
-            r = std::clamp(r, 0, 255); g = std::clamp(g, 0, 255); b = std::clamp(b, 0, 255);
+            size_t base = H.rec_len - 6;
+            r = le16(&rec[base]) >> 8;
+            g = le16(&rec[base + 2]) >> 8;
+            b = le16(&rec[base + 4]) >> 8;
         }
-        coords.push_back({(double)X, (double)Y, (double)Z});
+
+        coords.push_back({X, Y, Z});
         colors.push_back({(double)r, (double)g, (double)b});
     }
     return !coords.empty();
@@ -111,36 +125,66 @@ static bool extract_zip(const fs::path& zipfile,const fs::path& outdir){
 #else
 static bool extract_zip(const fs::path&,const fs::path&){ logf(3,"ZIP not supported (miniz missing)"); return false; }
 #endif
-static bool write_mc(const fs::path& out,const std::vector<Point3>& pts,const std::vector<int>& idx)
+
+static bool write_mc(
+    const fs::path& out,
+    const std::vector<Point3>& pts,
+    const std::vector<int>& idx)
 {
     std::ofstream f(out.string());
-    if(!f){ logf(ERR,"write fail %s",out.string().c_str()); return false; }
+    if (!f) {
+        logf(ERR, "write fail %s", out.string().c_str());
+        return false;
+    }
+
     f << "# generated\n# points:" << pts.size() << "\n";
-    for(size_t i=0;i<pts.size();++i){
-        auto &p = pts[i];
-        long X = (long)std::lround(p[0]);
-        long Y = (long)std::lround(p[1]);
-        long Z = (long)std::lround(p[2]);
+
+    const size_t n = pts.size();
+    const bool has_idx = (idx.size() == n);
+
+    for (size_t i = 0; i < n; ++i) {
+        const Point3& p = pts[i];
+
+        // pts はすでに整数化済みという前提
+        long X = std::lround(p[0]);
+        long Y = std::lround(p[1]);
+        long Z = std::lround(p[2]);
+
         const char* bn = "minecraft:stone";
-        if(i < idx.size()) bn = block_palette::block_name(idx[i]);
-        f << "setblock " << X << " " << Y << " " << Z << " " << bn << "\n";
+        if (has_idx)
+            bn = block_palette::block_name(idx[i]);
+
+        f << "setblock "
+          << X << " " << Y << " " << Z << " "
+          << bn << "\n";
     }
     return true;
 }
 
 // Write .mcfunction files split into fixed-size chunks (10000 lines per file)
-static bool write_mc_chunked(const fs::path& basepath, const std::string& base, const std::vector<Point3>& pts, const std::vector<int>& idx)
+static bool write_mc_chunked(
+    const fs::path& basepath,
+    const std::string& base,
+    const std::vector<Point3>& pts,
+    const std::vector<int>& idx)
 {
     constexpr int MAX_LINES = 10000;
+
     std::error_code ec;
     fs::create_directories(basepath, ec);
-    if (ec) { logf(3, "Failed to create output dir: %s", basepath.string().c_str()); return false; }
+    if (ec) {
+        logf(ERR, "Failed to create output dir: %s", basepath.string().c_str());
+        return false;
+    }
+
+    const size_t n = pts.size();
+    const bool has_idx = (idx.size() == n);
 
     int chunk = 1;
     int line = 0;
-    std::string outname;
     std::ofstream ofs;
-    auto open_chunk = [&](int c)->bool {
+
+    auto open_chunk = [&](int c) -> bool {
         if (ofs.is_open()) ofs.close();
         fs::path p = basepath / (base + "_slice_" + std::to_string(c) + ".mcfunction");
         ofs.open(p.string(), std::ios::out);
@@ -149,76 +193,163 @@ static bool write_mc_chunked(const fs::path& basepath, const std::string& base, 
 
     if (!open_chunk(chunk)) return false;
 
-    // Buffer lines to reduce syscall overhead
     std::string buffer;
     buffer.reserve(1024 * 1024);
 
-    for (size_t i = 0; i < pts.size(); ++i) {
-        auto &p = pts[i];
-        long X = (long)std::lround(p[0]), Y = (long)std::lround(p[1]), Z = (long)std::lround(p[2]);
+    for (size_t i = 0; i < n; ++i) {
+        const Point3& p = pts[i];
+
+        long X = (long)p[0];
+        long Y = (long)p[1];
+        long Z = (long)p[2];
+
         const char* bn = "minecraft:stone";
-        if (i < idx.size()) bn = block_palette::block_name(idx[i]);
-        buffer.append("setblock "); buffer.append(std::to_string(X)); buffer.push_back(' ');
-        buffer.append(std::to_string(Y)); buffer.push_back(' ');
-        buffer.append(std::to_string(Z)); buffer.append(" "); buffer.append(bn); buffer.append("\n");
-        ++line;
-        if (line >= MAX_LINES) {
-            // flush and open next
+        if (has_idx)
+            bn = block_palette::block_name(idx[i]);
+
+        buffer.append("setblock ");
+        buffer.append(std::to_string(X)).push_back(' ');
+        buffer.append(std::to_string(Y)).push_back(' ');
+        buffer.append(std::to_string(Z)).push_back(' ');
+        buffer.append(bn).push_back('\n');
+
+        if (++line >= MAX_LINES) {
             ofs << buffer;
-            ofs.flush();
             buffer.clear();
-            ++chunk; line = 0;
-            if (!open_chunk(chunk)) return false;
+            line = 0;
+            if (!open_chunk(++chunk)) return false;
         }
     }
-    if (!buffer.empty() && ofs.is_open()) ofs << buffer;
+
+    if (!buffer.empty()) ofs << buffer;
     if (ofs.is_open()) ofs.close();
     return true;
 }
 
-static bool process_single(const fs::path& in,const fs::path& out,double scale,bool prefer_cuda)
+static bool process_single(
+    const fs::path& in,
+    const fs::path& out,
+    double scale,
+    bool prefer_cuda)
 {
-    logf(INF,"processing %s -> %s (scale=%.3f,cuda=%s)", in.string().c_str(), out.string().c_str(), scale, prefer_cuda?"yes":"no");
+    logf(INF,
+        "processing %s -> %s (scale=%.3f,cuda=%s)",
+        in.string().c_str(),
+        out.string().c_str(),
+        scale,
+        prefer_cuda ? "yes" : "no");
+
+    // ----------------------------
+    // 1. load
+    // ----------------------------
     std::vector<Point3> pts;
-    bool ok = false;
-    auto ext = tolower_s(in.extension().string());
     std::vector<Point3> colors;
-    if(ext==".las"){
+
+    bool ok = false;
+    std::string ext = tolower_s(in.extension().string());
+
+    if (ext == ".las") {
         ok = load_points_from_las(in, pts, colors);
-        if(!ok){ logf(ERR,"Error: Failed to read LAS file %s.", in.string().c_str()); return false; }
+        if (!ok) {
+            logf(ERR, "Error: Failed to read LAS file %s.", in.string().c_str());
+            return false;
+        }
     }
-    else if(ext==".xyz"||ext==".txt"){
+    else if (ext == ".xyz" || ext == ".txt") {
         ok = load_xyz(in, pts);
-        if(!ok){ logf(ERR,"Error: Failed to load XYZ/text points from %s.", in.string().c_str()); return false; }
+        if (!ok) {
+            logf(ERR, "Error: Failed to load XYZ/text points from %s.", in.string().c_str());
+            return false;
+        }
     }
     else {
-        logf(ERR,"Error: Unsupported file extension for direct processing: %s. Expected .las, .xyz, or .txt for individual files.", in.string().c_str());
+        logf(ERR,
+            "Error: Unsupported file extension for direct processing: %s.",
+            in.string().c_str());
         return false;
     }
-    // If colors were provided (from LAS), build color points, otherwise use coordinates as color proxy
-    for(size_t i=0;i<pts.size();++i){
-        pts[i] = transform_XZ_negY(pts[i]);
-        if(scale!=1.0) pts[i] = apply_scale(pts[i],scale);
-    }
+
+    // ----------------------------
+    // 2. block palette mapping
+    //    （重複排除前・元点数基準）
+    // ----------------------------
     std::vector<int> idx;
-    if(!colors.empty()){
-        std::vector<Point3> color_pts; color_pts.reserve(colors.size());
-        for(size_t i=0;i<colors.size();++i) color_pts.push_back(colors[i]);
-        block_palette::map_blocks(color_pts, idx, prefer_cuda);
+
+    if (!colors.empty()) {
+        block_palette::map_blocks(colors, idx, prefer_cuda);
     } else {
         block_palette::map_blocks(pts, idx, prefer_cuda);
     }
+
+    // ----------------------------
+    // 3. transform + scale + quantize + deduplicate
+    //    （pts / idx 完全同期）
+    // ----------------------------
+    std::vector<Point3> out_pts;
+    std::vector<int>    out_idx;
+
+    out_pts.reserve(pts.size());
+    out_idx.reserve(pts.size());
+
+    std::unordered_set<uint64_t> seen;
+    seen.reserve(pts.size());
+
+    for (size_t i = 0; i < pts.size(); ++i) {
+
+        // transform
+        Point3 p = transform_XZ_negY(pts[i]);
+
+        // scale
+        if (scale != 1.0)
+            p = apply_scale(p, scale);
+
+        // quantize to Minecraft grid
+        long X = std::lround(p[0]);
+        long Y = std::lround(p[1]);
+        long Z = std::lround(p[2]);
+
+        // 21bit signed packing per axis
+        uint64_t key =
+            ((uint64_t)(X & 0x1FFFFF) << 42) |
+            ((uint64_t)(Y & 0x1FFFFF) << 21) |
+            ((uint64_t)(Z & 0x1FFFFF));
+
+        // deduplicate AFTER scale
+        if (!seen.insert(key).second)
+            continue;
+
+        out_pts.push_back({ (double)X, (double)Y, (double)Z });
+
+        // keep idx perfectly aligned
+        if (i < idx.size())
+            out_idx.push_back(idx[i]);
+        else
+            out_idx.push_back(0); // fallback: stone
+    }
+
+    // swap results
+    pts.swap(out_pts);
+    idx.swap(out_idx);
+
+    // ----------------------------
+    // 4. output
+    // ----------------------------
     fs::path outp = out;
-    if (fs::is_directory(outp) || outp.string().back() == '\\' || outp.string().back() == '/') {
+
+    if (fs::is_directory(outp)
+        || outp.string().back() == '\\'
+        || outp.string().back() == '/')
+    {
         fs::create_directories(outp);
-        // write chunked files into the directory using the input stem as base name
         std::string base = in.stem().string();
         return write_mc_chunked(outp, base, pts, idx);
     }
-    // If outp is a file path, ensure parent dir exists and write single file (but still chunk if large)
-    fs::path parent = outp.parent_path(); if (!parent.empty()) fs::create_directories(parent);
+
+    fs::path parent = outp.parent_path();
+    if (!parent.empty())
+        fs::create_directories(parent);
+
     std::string base = outp.stem().string();
-    // write into parent using provided filename base
     return write_mc_chunked(parent, base, pts, idx);
 }
 
